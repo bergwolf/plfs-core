@@ -57,6 +57,11 @@ typedef struct {
     pthread_mutex_t mux;    // to lock the queue
 } ReaderArgs;
 
+typedef struct{
+    vector<plfs_pathback> files, dirs, links;
+    string accessfile;
+} plfs_container_path;
+
 ssize_t plfs_reference_count( Container_OpenFile * );
 
 char *plfs_gethostname()
@@ -299,9 +304,8 @@ isReader( int flags )
 // everything that way.
 // returns 0 or -err
 int
-plfs_collect_from_containers(const char *logical, vector<plfs_pathback> &files,
-                             vector<plfs_pathback> &dirs,
-                             vector<plfs_pathback> &links)
+plfs_collect_from_containers(const char *logical,
+                             vector<plfs_container_path> &allpath)
 {
     PLFS_ENTER;
     vector<plfs_pathback> possible_containers;
@@ -313,13 +317,65 @@ plfs_collect_from_containers(const char *logical, vector<plfs_pathback> &files,
     for(itr=possible_containers.begin();
             itr!=possible_containers.end();
             itr++) {
+        plfs_container_path cpath;
+        cpath.accessfile = Container::getAccessFilePath(itr->bpath);
         ret = Util::traverseDirectoryTree(itr->bpath.c_str(), itr->back,
-                                          files,dirs,links);
+                                          cpath.files,cpath.dirs,cpath.links);
         if (ret < 0) {
             break;
         }
+        allpath.push_back(cpath);
     }
     PLFS_EXIT(ret);
+}
+
+int
+plfs_container_perform_op(plfs_container_path& cpath, FileOp& op, bool is_container)
+{
+    int ret = 0;
+    // now apply the operation to each operand so long as ret==0.  dirs must be
+    // done in reverse order and files must be done first.  This is necessary
+    // for when op is unlink since children must be unlinked first.  for the
+    // other ops, order doesn't matter.
+    vector<plfs_pathback>::reverse_iterator ritr;
+    for(ritr = cpath.files.rbegin();
+        ritr != cpath.files.rend() && ret == 0;
+        ++ritr)
+    {
+        // In container mode, we want to special treat accessfile deletion,
+        // because once accessfile deleted, the top directory will no longer
+        // be viewed as a container. Defer accessfile deletion until last moment
+        // so that if anything fails in the middle, the container information
+        // remains.
+        if (is_container && cpath.accessfile == ritr->bpath) {
+            mlog(INT_DCOMMON, "%s skipping accessfile %s",
+                              __FUNCTION__, ritr->bpath.c_str());
+            continue;
+        }
+        mlog(INT_DCOMMON, "%s on %s",__FUNCTION__,ritr->bpath.c_str());
+        ret = op.op(ritr->bpath.c_str(),DT_REG,ritr->back->store);
+    }
+    for(ritr = cpath.links.rbegin();
+        ritr != cpath.links.rend() && ret == 0;
+        ++ritr)
+    {
+        op.op(ritr->bpath.c_str(),DT_LNK,ritr->back->store);
+    }
+    for(ritr = cpath.dirs.rbegin();
+        ritr != cpath.dirs.rend() && ret == 0;
+        ++ritr)
+    {
+        if (is_container && cpath.dirs.rend() == (ritr + 1)) {
+            mlog(INT_DCOMMON, "%s deleting accessfile %s",
+                              __FUNCTION__, cpath.accessfile.c_str());
+            ret = op.op(cpath.accessfile.c_str(),DT_REG,ritr->back->store);
+            if (ret != 0)
+                break;
+        }
+        ret = op.op(ritr->bpath.c_str(),is_container?DT_CONTAINER:DT_DIR,
+                    ritr->back->store);
+    }
+    return ret;
 }
 
 // this function is shared by chmod/utime/chown maybe others
@@ -335,8 +391,10 @@ int
 plfs_file_operation(const char *logical, FileOp& op)
 {
     PLFS_ENTER;
-    vector<plfs_pathback> files, dirs, links;
+    vector<plfs_container_path> paths;
+    plfs_container_path cpath;
     struct plfs_pathback pb;
+
     // first go through and find the set of physical files and dirs
     // that need to be operated on
     // if it's a PLFS file, then maybe we just operate on
@@ -350,37 +408,30 @@ plfs_file_operation(const char *logical, FileOp& op)
         if (op.onlyAccessFile()) {
             pb.bpath = Container::getAccessFilePath(path);
             pb.back = expansion_info.backend;
-            files.push_back(pb);
+            cpath.files.push_back(pb);
             ret = 0;    // ret was one from is_plfs_file
         } else {
             // everything
-            is_container=true;
-            ret = plfs_collect_from_containers(logical,files,dirs,links);
+            is_container = true;
+            ret = plfs_collect_from_containers(logical, paths);
         }
     } else if (S_ISDIR(mode)) { // need to iterate across dirs
-        ret = find_all_expansions(logical,dirs);
+        ret = find_all_expansions(logical,cpath.dirs);
     } else {
         // ENOENT, a symlink, somehow a flat file in here
         pb.bpath = path;
         pb.back = expansion_info.backend;
-        files.push_back(pb);  // we might want to reset ret to 0 here
+        cpath.files.push_back(pb);  // we might want to reset ret to 0 here
     }
-    // now apply the operation to each operand so long as ret==0.  dirs must be
-    // done in reverse order and files must be done first.  This is necessary
-    // for when op is unlink since children must be unlinked first.  for the
-    // other ops, order doesn't matter.
-    vector<plfs_pathback>::reverse_iterator ritr;
-    for(ritr = files.rbegin(); ritr != files.rend() && ret == 0; ++ritr) {
-        mlog(INT_DCOMMON, "%s on %s",__FUNCTION__,ritr->bpath.c_str());
-        ret = op.op(ritr->bpath.c_str(),DT_REG,ritr->back->store); 
+
+    if (! is_container)
+        paths.push_back(cpath);
+
+    vector<plfs_container_path>::iterator itr;
+    for (itr = paths.begin(); itr != paths.end() && ret == 0; ++itr) {
+        ret = plfs_container_perform_op(*itr, op, is_container);
     }
-    for(ritr = links.rbegin(); ritr != links.rend() && ret == 0; ++ritr) {
-        op.op(ritr->bpath.c_str(),DT_LNK,ritr->back->store);
-    }
-    for(ritr = dirs.rbegin(); ritr != dirs.rend() && ret == 0; ++ritr) {
-        ret = op.op(ritr->bpath.c_str(),is_container?DT_CONTAINER:DT_DIR,
-                    ritr->back->store);
-    }
+
     mlog(INT_DAPI, "%s: ret %d", __FUNCTION__,ret);
     PLFS_EXIT(ret);
 }
