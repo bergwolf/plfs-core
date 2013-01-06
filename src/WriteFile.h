@@ -21,7 +21,10 @@ using namespace std;
 struct
 OpenFh {
     IOSHandle *fh;
-    int writers;
+    // Now that fh may not be opened during container_open, we track openFh
+    // reference count in WriteFile::fhs_writers. OpenFh structure is still
+    // preserved as an abstraction over iostore fh.
+//  int writers;
 };
 
 class WriteFile : public Metadata
@@ -34,15 +37,15 @@ class WriteFile : public Metadata
         int openIndex( pid_t );
         int closeIndex();
 
-        int addWriter( pid_t, bool child );
+        int addWriter( pid_t, bool, int& );
         int removeWriter( pid_t );
         size_t numWriters();
         size_t maxWriters() {
             return max_writers;
         }
 
-        int truncate( off_t offset );
-        int extend( off_t offset );
+        int truncate( off_t, pid_t );
+        int extend( off_t, pid_t );
 
         ssize_t write( const char *, size_t, off_t, pid_t );
 
@@ -69,12 +72,14 @@ class WriteFile : public Metadata
         int Close( );
         int closeFh( IOSHandle *fh );
         struct OpenFh *getFh( pid_t pid );
+        int prepareForWrite( pid_t pid );
 
         string container_path;
         string subdir_path;
         struct plfs_backend *subdirback;
         string hostname;
         map< pid_t, OpenFh  > fhs;
+        map< pid_t, int > fhs_writers;
         // need to remember fd paths to restore
         map< IOSHandle *, string > paths;
         pthread_mutex_t    index_mux;  // to use the shared index

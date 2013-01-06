@@ -207,43 +207,34 @@ int
 addWriter(WriteFile *wf, pid_t pid, const char *path, mode_t mode,
           string logical )
 {
-    int ret = -ENOENT;  // be pessimistic
-    int writers = 0;
-    struct plfs_backend *newback;
-    // might have to loop 3 times
-    // first discover that the subdir doesn't exist
-    // try to create it and try again
-    // if we fail to create it bec someone else created a metalink there
-    // then try again into where the metalink resolves
-    // but that might fail if our sibling hasn't created where it resolves yet
-    // so help our sibling create it, and then finally try the third time.
-    for( int attempts = 0; attempts < 2; attempts++ ) {
-        // ok, the WriteFile *wf has a container path in it which is
-        // path to canonical.  It attempts to open a file in a subdir
-        // at that path.  If it fails, it should be bec there is no
-        // subdir in the canonical. [If it fails for any other reason, something
-        // is badly broken somewhere.]
-        // When it fails, create the hostdir.  It might be a metalink in
-        // which case change the container path in the WriteFile to shadow path
-        writers = ret = wf->addWriter( pid, false );
-        if ( ret != -ENOENT ) {
-            break;    // everything except ENOENT leaves
-        }
-        // if we get here, the hostdir doesn't exist (we got ENOENT)
-        // here is a super simple place to add the distributed metadata stuff.
-        // 1) create a shadow container by hashing on node name
-        // 2) create a shadow hostdir inside it
-        // 3) create a metalink in canonical container identifying shadow
-        // 4) change the WriteFile path to point to shadow
-        // 4) loop and try one more time
-        string physical_hostdir;
-        bool use_metalink = false;
-        // discover all physical paths from logical one
-        ContainerPaths paths;
-        ret = findContainerPaths(logical,paths);
-        if (ret!=0) {
-            PLFS_EXIT(ret);
-        }
+    int ret, writers;
+    // Here first see if wf is already opened for given pid.
+    // If not, try to make hostdir, and manipulate metalink games.
+    ret = wf->addWriter( pid, true, writers );
+    if (ret == 0)
+        PLFS_EXIT(writers);
+
+    // if we get here, wf isn't opened yet (we got EAGAIN)
+    // here is a super simple place to add the distributed metadata stuff.
+    // 1) create a shadow container by hashing on node name
+    // 2) create a shadow hostdir inside it
+    // 3) create a metalink in canonical container identifying shadow
+    // 4) change the WriteFile path to point to shadow
+    // 4) loop and try one more time
+    string physical_hostdir;
+    bool use_metalink = false;
+    // discover all physical paths from logical one
+    ContainerPaths paths;
+    ret = findContainerPaths(logical,paths);
+    if (ret!=0) {
+        PLFS_EXIT(ret);
+    }
+
+    // Bellow retry logic is left just to be cautious, because
+    // Container::makeHostDir already handles -EEXISTS and -EISDIR
+    // XXX: does mkdir(2) ever fails with -EISDIR? I don't think so...
+    for ( int attempts = 0; attempts < 1; attempts++ ) {
+        struct plfs_backend *newback;
         ret=Container::makeHostDir(paths, mode, PARENT_ABSENT,
                                    physical_hostdir, &newback, use_metalink);
         if ( ret==0 ) {
@@ -255,12 +246,13 @@ addWriter(WriteFile *wf, pid_t pid, const char *path, mode_t mode,
             } else {
                 wf->setContainerPath(paths.shadow);
             }
+            break;
         } else {
             mlog(INT_DRARE,"Something weird in %s for %s.  Retrying.",
                  __FUNCTION__, paths.shadow.c_str());
-            continue;
         }
     }
+
     // all done.  we return either -err or number of writers.
     if ( ret == 0 ) {
         ret = writers;
@@ -1612,9 +1604,6 @@ container_open(Container_OpenFile **pfd,const char *logical,int flags,
         if ( ret > 0 ) {
             ret = 0;    // add writer returns # of current writers
         }
-        if ( ret == 0 && new_writefile ) {
-            ret = wf->openIndex( pid );
-        }
         if ( ret != 0 && wf ) {
             delete wf;
             wf = NULL;
@@ -2095,7 +2084,7 @@ container_trunc(Container_OpenFile *of, const char *logical, off_t offset,
                 } else {
                     uid_t uid = 0;  /* just needed for stats */
                     wf = myopenfd->getWritefile(); /* can't fail */
-                    ret = wf->extend(offset);      /* zero byte write */
+                    ret = wf->extend(offset, pid); /* zero byte write */
                     /* ignore close ret, can't do much with it here */
                     (void)container_close(myopenfd, pid, uid, O_WRONLY, NULL);
                 }
@@ -2110,7 +2099,7 @@ container_trunc(Container_OpenFile *of, const char *logical, off_t offset,
         if (offset <= stbuf.st_size) {
             ret = Container::truncateMeta(path, offset, expansion_info.backend);
             if (ret==0) {
-                ret = of->getWritefile()->truncate( offset );
+                ret = of->getWritefile()->truncate( offset, of->getPid() );
             }
         }
         of->truncate( offset );

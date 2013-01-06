@@ -77,6 +77,14 @@ WriteFile::~WriteFile()
 int WriteFile::sync()
 {
     int ret = 0;
+
+    // No writers yet? nothing to sync.
+    if ( fhs.empty() ) {
+        // index should also be NULL. check that.
+        assert( index == NULL );
+        return ret;
+    }
+
     // iterate through and sync all open fds
     Util::MutexLock( &data_mux, __FUNCTION__ );
     map<pid_t, OpenFh >::iterator pids_itr;
@@ -128,34 +136,55 @@ int WriteFile::sync( pid_t pid )
 }
 
 
-// returns -err or number of writers
-int WriteFile::addWriter( pid_t pid, bool child )
+// Returns 0 in following cases:
+// 1. ofh exists
+// 2. or we create new ofh
+// 3. or parent dir is ready to hold droppings
+//
+// Number of writers is always passed out by writers argument
+//
+// The life cycle of an ofh is:
+// At open, all possible writers take a reference on ofh, which may not be
+// created yet. Whoever first writes creates the ofh and put it in fhs map.
+// During close, the last closer of the ofh gets the chance to destroy the ofh.
+int WriteFile::addWriter( pid_t pid, bool for_open, int& writers )
 {
-    int ret = 0;
-    Util::MutexLock(   &data_mux, __FUNCTION__ );
+    int ret = -EAGAIN;
+    Util::MutexLock( &data_mux, __FUNCTION__ );
     struct OpenFh *ofh = getFh( pid );
-    if (ofh != NULL) {
-        ofh->writers++;
-    } else {
-        /* note: this uses subdirback from object to open */
+    if ( ofh != NULL ) {
+        ret = 0;
+    } else if ( !for_open ) {
+        // note: this uses subdirback from object to open
         IOSHandle *fh;
-        fh = openDataFile( subdir_path, hostname, pid, DROPPING_MODE, ret);
+        fh = openDataFile( subdir_path, hostname, pid, DROPPING_MODE, ret );
         if ( fh != NULL ) {
             struct OpenFh xofh;
-            xofh.writers = 1;
             xofh.fh = fh;
             fhs[pid] = xofh;
         } // else, ret was already set
+    } else {
+        // check parent hostdir existence so that caller don't need to bother
+        // creating it.
+        string hostdir = Container::getHostDirPath( subdir_path, hostname,
+                                                    PERM_SUBDIR );
+        if ( Util::isDirectory( hostdir.c_str(), subdirback->store ))
+            ret = 0;
     }
-    int writers = incrementOpens(0);
-    if ( ret == 0 && ! child ) {
+
+    if ( for_open ) {
+        // For new entry, std::map initilizes to 0
+        fhs_writers[pid]++;
+        max_writers++;
         writers = incrementOpens(1);
+    } else {
+        writers = incrementOpens(0);
     }
-    max_writers++;
+
     mlog(WF_DAPI, "%s (%d) on %s now has %d writers",
          __FUNCTION__, pid, container_path.c_str(), writers );
     Util::MutexUnlock( &data_mux, __FUNCTION__ );
-    return ( ret == 0 ? writers : ret );
+    return ret;
 }
 
 size_t WriteFile::numWriters( )
@@ -165,9 +194,12 @@ size_t WriteFile::numWriters( )
     if ( paranoid_about_reference_counting ) {
         int check = 0;
         Util::MutexLock(   &data_mux, __FUNCTION__ );
-        map<pid_t, OpenFh >::iterator pids_itr;
-        for( pids_itr = fhs.begin(); pids_itr != fhs.end(); pids_itr++ ) {
-            check += pids_itr->second.writers;
+        map<pid_t, int >::iterator pids_itr;
+        for( pids_itr = fhs_writers.begin();
+             pids_itr != fhs_writers.end();
+             pids_itr++ )
+        {
+            check += pids_itr->second;
         }
         if ( writers != check ) {
             mlog(WF_DRARE, "%s %d not equal %d", __FUNCTION__,
@@ -246,40 +278,64 @@ int
 WriteFile::removeWriter( pid_t pid )
 {
     int ret = 0;
-    Util::MutexLock(   &data_mux , __FUNCTION__);
-    struct OpenFh *ofh = getFh( pid );
+
+    Util::MutexLock( &data_mux, __FUNCTION__ );
     int writers = incrementOpens(-1);
-    if ( ofh == NULL ) {
-        // if we can't find it, we still decrement the writers count
-        // this is strange but sometimes fuse does weird things w/ pids
-        // if the writers goes zero, when this struct is freed, everything
-        // gets cleaned up
-        mlog(WF_CRIT, "%s can't find pid %d", __FUNCTION__, pid );
-        assert( 0 );
-    } else {
-        ofh->writers--;
-        if ( ofh->writers <= 0 ) {
+    // Only the last closer of an ofh gets the chance to destroy it
+    if ( --fhs_writers[pid] <= 0 ) {
+        struct OpenFh *ofh = getFh( pid );
+        if ( ofh != NULL) {
             ret = closeFh( ofh->fh );
             fhs.erase( pid );
         }
+        fhs_writers.erase( pid );
     }
+    Util::MutexUnlock( &data_mux, __FUNCTION__ );
+
     mlog(WF_DAPI, "%s (%d) on %s now has %d writers: %d",
          __FUNCTION__, pid, container_path.c_str(), writers, ret );
-    Util::MutexUnlock( &data_mux, __FUNCTION__ );
     return ( ret == 0 ? writers : ret );
 }
 
+// return 0 on success. -err on error
 int
-WriteFile::extend( off_t offset )
+WriteFile::extend( off_t offset, pid_t pid )
 {
-    // make a fake write
-    if ( fhs.begin() == fhs.end() ) {
-        return -ENOENT;
+    // make a fake write. We may be the first writer.
+    int ret;
+    ret = prepareForWrite( pid );
+    if ( ret == 0 ) {
+        index->addWrite( offset, 0, pid, createtime, createtime );
+        addWrite( offset, 0 );   // maintain metadata
     }
-    pid_t p = fhs.begin()->first;
-    index->addWrite( offset, 0, p, createtime, createtime );
-    addWrite( offset, 0 );   // maintain metadata
-    return 0;
+
+    return ret;
+}
+
+// return 0 on success. -err on error
+int
+WriteFile::prepareForWrite( pid_t pid )
+{
+    int ret = 0;
+    OpenFh *ofh;
+
+    ofh = getFh( pid );
+    if ( ofh == NULL ) {
+        // After changing to avoid creating empty data dropping and
+        // index files in open, we defer the creation until first
+        // write, which is here.
+        int unused;
+        ret = addWriter( pid, false, unused );
+    }
+
+    // we also defer creating index dropping. so index may be NULL.
+    if ( ret == 0 && index == NULL ) {
+        ret = openIndex( pid );
+        if (ret < 0)
+            mlog(WF_ERR, "%s open index failed", __FUNCTION__);
+    }
+
+    return (ret >= 0) ? 0 : ret;
 }
 
 // we are currently doing synchronous index writing.
@@ -294,20 +350,10 @@ WriteFile::write(const char *buf, size_t size, off_t offset, pid_t pid)
 {
     int ret = 0;
     ssize_t written;
-    OpenFh *ofh = getFh( pid );
-    if ( ofh == NULL ) {
-        // we used to return -ENOENT here but we can get here legitimately
-        // when a parent opens a file and a child writes to it.
-        // so when we get here, we need to add a child datafile
-        ret = addWriter( pid, true );
-        if ( ret > 0 ) {
-            // however, this screws up the reference count
-            // it looks like a new writer but it's multiple writers
-            // sharing an fd ...
-            ofh = getFh( pid );
-        }
-    }
-    if ( ofh != NULL && ret >= 0 ) {
+
+    ret = prepareForWrite( pid );
+    if ( ret == 0 ) {
+        OpenFh *ofh = getFh( pid );
         IOSHandle *wfh = ofh->fh;
         // write the data file
         double begin, end;
@@ -342,23 +388,31 @@ WriteFile::write(const char *buf, size_t size, off_t offset, pid_t pid)
 
 // this assumes that the hostdir exists and is full valid path
 // returns 0 or -err
-int WriteFile::openIndex( pid_t pid ) {
+int WriteFile::openIndex( pid_t pid )
+{
     int ret = 0;
+
+    Util::MutexLock( &index_mux, __FUNCTION__ );
+    if ( index != NULL ) {
+        // someone created index for us... That's OK.
+        Util::MutexUnlock( &index_mux, __FUNCTION__ );
+        return ret;
+    }
+
     string index_path;
     /* note: this uses subdirback from obj to open */
     IOSHandle *fh = openIndexFile(subdir_path, hostname, pid, DROPPING_MODE,
                                   &index_path, ret);
     if ( fh != NULL ) {
-        Util::MutexLock(&index_mux , __FUNCTION__);
         //XXXCDC:iostore need to pass the backend down into index?
         index = new Index(container_path, subdirback, fh);
-        Util::MutexUnlock(&index_mux, __FUNCTION__);
         mlog(WF_DAPI, "In open Index path is %s",index_path.c_str());
-        index->index_path=index_path;
-        if(index_buffer_mbs) {
+        index->index_path = index_path;
+        if ( index_buffer_mbs )
             index->startBuffering();
-        }
     }
+    Util::MutexUnlock( &index_mux, __FUNCTION__ );
+
     return ret;
 }
 
@@ -367,6 +421,11 @@ int WriteFile::closeIndex( )
     IOSHandle *closefh;
     struct plfs_backend *ib;
     int ret = 0;
+
+    // index is not opened
+    if ( index == NULL )
+        return ret;
+
     Util::MutexLock(   &index_mux , __FUNCTION__);
     ret = index->flush();
     closefh = index->getFh(&ib);
@@ -398,9 +457,17 @@ int WriteFile::Close()
 }
 
 // returns 0 or -err
-int WriteFile::truncate( off_t offset )
+int WriteFile::truncate( off_t offset, pid_t pid )
 {
+    int ret = 0;
     Metadata::truncate( offset );
+    // we may be the first writer...
+    if ( index == NULL ) {
+        OpenFh *ofh;
+        ret = prepareForWrite( pid );
+        if ( ret < 0 )
+            return ret;
+    }
     index->truncateHostIndex( offset );
     return 0;
 }
